@@ -9,7 +9,7 @@ require (
 	github.com/json-iterator/go v1.1.12
 	github.com/lxzan/gws v1.9.1
 	github.com/mailru/easyjson v0.9.2
-	github.com/sethvargo/go-retry v0.3.0
+	github.com/sethvargo/go-retry v0.4.0
 	github.com/shopspring/decimal v1.4.0
 	github.com/sonirico/vago v0.11.4
 	github.com/sonirico/vago/lol v0.1.0
