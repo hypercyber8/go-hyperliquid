@@ -1,0 +1,1124 @@
+package hyperliquid
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"sync"
+	"sync/atomic"
+)
+
+const (
+	// spotAssetIndexOffset is the offset added to spot asset indices
+	spotAssetIndexOffset = 10000
+	// builderPerpAssetBase is the base offset for builder-deployed perp asset ids.
+	// See Asset IDs docs: asset = 100000 + perpDexIndex*10000 + indexInMeta.
+	builderPerpAssetBase = 100000
+)
+
+// coinSnap is the immutable lookup table for coin ↔ asset ↔ szDecimals,
+// published via Info.coins with atomic.Pointer. Readers take one Load and
+// do all their lookups from the same snapshot so a concurrent RegisterCoin
+// cannot split a (coin, asset, szDecimals) triple across two lookups.
+// Never mutate after Store — always clone + Store a new snapshot.
+type coinSnap struct {
+	coinToAsset    map[string]int
+	assetToCoin    map[int]string
+	assetToDecimal map[int]int
+}
+
+func newCoinSnap() *coinSnap {
+	return &coinSnap{
+		coinToAsset:    make(map[string]int),
+		assetToCoin:    make(map[int]string),
+		assetToDecimal: make(map[int]int),
+	}
+}
+
+func (s *coinSnap) clone() *coinSnap {
+	out := &coinSnap{
+		coinToAsset:    make(map[string]int, len(s.coinToAsset)+1),
+		assetToCoin:    make(map[int]string, len(s.assetToCoin)+1),
+		assetToDecimal: make(map[int]int, len(s.assetToDecimal)+1),
+	}
+	for k, v := range s.coinToAsset {
+		out.coinToAsset[k] = v
+	}
+	for k, v := range s.assetToCoin {
+		out.assetToCoin[k] = v
+	}
+	for k, v := range s.assetToDecimal {
+		out.assetToDecimal[k] = v
+	}
+	return out
+}
+
+type Info struct {
+	debug        bool
+	client       *client
+	coins        atomic.Pointer[coinSnap] // coin/asset/szDecimals lookups, copy-on-write
+	coinsWriteMu sync.Mutex               // serialize writers so Load→clone→Store is not lossy
+	perpDexName  string
+	clientOpts   []ClientOpt
+}
+
+func NewInfo(
+	ctx context.Context,
+	baseURL string,
+	skipWS bool,
+	meta *Meta,
+	spotMeta *SpotMeta,
+	perpDexs *MixedArray,
+	opts ...InfoOpt,
+) (*Info, error) {
+	info := &Info{}
+	// Seed an empty snapshot so Load never returns nil even if NewInfo bails
+	// out before the final Store (e.g. meta fetch fails).
+	info.coins.Store(newCoinSnap())
+
+	for _, opt := range opts {
+		opt.Apply(info)
+	}
+
+	if info.debug {
+		info.clientOpts = append(info.clientOpts, clientOptDebugMode())
+	}
+
+	info.client = newClient(baseURL, info.clientOpts...)
+
+	if meta == nil {
+		var err error
+		meta, err = info.Meta(ctx)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	if spotMeta == nil {
+		var err error
+		spotMeta, err = info.SpotMeta(ctx)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	// Build the snapshot on a throwaway struct (single-threaded init) and
+	// publish once at the end. Callers that hit CoinToAsset before NewInfo
+	// returns would see the empty seed — acceptable since Info isn't reachable
+	// yet anyway.
+	snap := newCoinSnap()
+
+	// Map perp assets
+	if info.perpDexName != "" {
+		// Builder-deployed perp: compute full asset id as documented.
+		if perpDexs == nil {
+			var err error
+			perpDexsNew, err := info.PerpDexs(ctx)
+			perpDexs = &perpDexsNew
+			if err != nil {
+				return nil, err
+			}
+		}
+		perpDexIndex := -1
+		for i, mv := range *perpDexs {
+			if mv.Type() != "object" {
+				continue
+			}
+			var pd PerpDex
+			if err := mv.Parse(&pd); err == nil && pd.Name == info.perpDexName {
+				perpDexIndex = i
+				break
+			}
+		}
+		if perpDexIndex < 0 {
+			return nil, fmt.Errorf("unknown perp dex %q (not present in /info perpDexs)", info.perpDexName)
+		}
+		base := builderPerpAssetBase + perpDexIndex*10000
+		for idxInMeta, assetInfo := range meta.Universe {
+			assetID := base + idxInMeta
+			snap.coinToAsset[assetInfo.Name] = assetID
+			snap.assetToCoin[assetID] = assetInfo.Name
+			snap.assetToDecimal[assetID] = assetInfo.SzDecimals
+		}
+	} else {
+		// Default perp dex: asset id is just index in meta universe.
+		for asset, assetInfo := range meta.Universe {
+			snap.coinToAsset[assetInfo.Name] = asset
+			snap.assetToCoin[asset] = assetInfo.Name
+			snap.assetToDecimal[asset] = assetInfo.SzDecimals
+		}
+	}
+
+	// Build a lookup map from token Index value to SpotTokenInfo, because
+	// SpotAssetInfo.Tokens[0] holds a logical token Index, not the array position.
+	tokensByIndex := make(map[int]SpotTokenInfo, len(spotMeta.Tokens))
+	for _, t := range spotMeta.Tokens {
+		tokensByIndex[t.Index] = t
+	}
+
+	// Map spot assets starting at 10000
+	for _, spotInfo := range spotMeta.Universe {
+		asset := spotInfo.Index + spotAssetIndexOffset
+		snap.coinToAsset[spotInfo.Name] = asset
+		if len(spotInfo.Tokens) > 0 {
+			if tokenInfo, ok := tokensByIndex[spotInfo.Tokens[0]]; ok {
+				snap.assetToDecimal[asset] = tokenInfo.SzDecimals
+			}
+		}
+	}
+
+	info.coins.Store(snap)
+	return info, nil
+}
+
+// postTimeRangeRequest makes a POST request with time range parameters
+func (i *Info) postTimeRangeRequest(
+	ctx context.Context,
+	requestType, user string,
+	startTime int64,
+	endTime *int64,
+	extraParams map[string]any,
+) ([]byte, error) {
+	payload := map[string]any{
+		"type":      requestType,
+		"startTime": startTime,
+	}
+	if user != "" {
+		payload["user"] = user
+	}
+	if endTime != nil {
+		payload["endTime"] = *endTime
+	}
+	for k, v := range extraParams {
+		payload[k] = v
+	}
+
+	resp, err := i.client.post(ctx, "/info", payload)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch %s: %w", requestType, err)
+	}
+	return resp, nil
+}
+
+func parseMetaResponse(resp []byte) (*Meta, error) {
+	var meta map[string]json.RawMessage
+	if err := jUnmarshal(resp, &meta); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal meta response: %w", err)
+	}
+
+	var universe []AssetInfo
+	if err := jUnmarshal(meta["universe"], &universe); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal universe: %w", err)
+	}
+
+	var marginTables [][]any
+	if err := jUnmarshal(meta["marginTables"], &marginTables); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal margin tables: %w", err)
+	}
+
+	marginTablesResult := make([]MarginTable, len(marginTables))
+	for i, marginTable := range marginTables {
+		id, ok := marginTable[0].(float64)
+		if !ok {
+			return nil, fmt.Errorf("expected float64 for margin table ID at index %d, got %T", i, marginTable[0])
+		}
+		tableBytes, err := jMarshal(marginTable[1])
+		if err != nil {
+			return nil, fmt.Errorf("failed to marshal margin table data: %w", err)
+		}
+
+		var marginTableData map[string]any
+		if err := jUnmarshal(tableBytes, &marginTableData); err != nil {
+			return nil, fmt.Errorf("failed to unmarshal margin table data: %w", err)
+		}
+
+		marginTiersBytes, err := jMarshal(marginTableData["marginTiers"])
+		if err != nil {
+			return nil, fmt.Errorf("failed to marshal margin tiers: %w", err)
+		}
+
+		var marginTiers []MarginTier
+		if err := jUnmarshal(marginTiersBytes, &marginTiers); err != nil {
+			return nil, fmt.Errorf("failed to unmarshal margin tiers: %w", err)
+		}
+
+		desc, ok := marginTableData["description"].(string)
+		if !ok {
+			return nil, fmt.Errorf("expected string for margin table description at index %d, got %T", i, marginTableData["description"])
+		}
+
+		marginTablesResult[i] = MarginTable{
+			ID:          int(id),
+			Description: desc,
+			MarginTiers: marginTiers,
+		}
+	}
+
+	// Parse collateralToken (index into SpotMeta.Tokens for this dex's quote currency).
+	// Default perp dex uses 0 (USDC), builder dexes may use different tokens.
+	collateralToken := 0
+	if raw, ok := meta["collateralToken"]; ok {
+		var ct int
+		if err := json.Unmarshal(raw, &ct); err == nil {
+			collateralToken = ct
+		}
+	}
+
+	return &Meta{
+		Universe:        universe,
+		MarginTables:    marginTablesResult,
+		CollateralToken: collateralToken,
+	}, nil
+}
+
+// Meta retrieves perpetuals metadata
+// If dex is empty string, returns metadata for the first perp dex (default)
+func (i *Info) Meta(ctx context.Context, dex ...string) (*Meta, error) {
+	payload := map[string]any{
+		"type": "meta",
+	}
+	if len(dex) > 0 && dex[0] != "" {
+		payload["dex"] = dex[0]
+	}
+
+	resp, err := i.client.post(ctx, "/info", payload)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch meta: %w", err)
+	}
+
+	return parseMetaResponse(resp)
+}
+
+func (i *Info) SpotMeta(ctx context.Context) (*SpotMeta, error) {
+	resp, err := i.client.post(ctx, "/info", map[string]any{
+		"type": "spotMeta",
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch spot meta: %w", err)
+	}
+
+	var spotMeta SpotMeta
+	if err := jUnmarshal(resp, &spotMeta); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal spot meta response: %w", err)
+	}
+
+	return &spotMeta, nil
+}
+
+func (i *Info) CoinToAsset(coin string) (int, bool) {
+	s := i.coins.Load()
+	result, ok := s.coinToAsset[coin]
+	return result, ok
+}
+
+// AssetDecimals returns the szDecimals registered for an asset index, if any.
+func (i *Info) AssetDecimals(asset int) (int, bool) {
+	s := i.coins.Load()
+	sz, ok := s.assetToDecimal[asset]
+	return sz, ok
+}
+
+// RegisterCoin adds a coin → asset mapping. Used to register builder-deployed
+// perp assets that weren't loaded during NewInfo (which only loads the default
+// dex or a single named dex). Safe to call while readers are in flight —
+// publishes a new immutable snapshot atomically. coinsWriteMu serialises
+// concurrent writers so the Load→clone→Store path isn't lossy.
+func (i *Info) RegisterCoin(coin string, asset, szDecimals int) {
+	i.coinsWriteMu.Lock()
+	defer i.coinsWriteMu.Unlock()
+	next := i.coins.Load().clone()
+	next.coinToAsset[coin] = asset
+	next.assetToCoin[asset] = coin
+	next.assetToDecimal[asset] = szDecimals
+	i.coins.Store(next)
+}
+
+// LookupAsset returns the coin name for an asset index, if registered.
+func (i *Info) LookupAsset(asset int) (string, bool) {
+	s := i.coins.Load()
+	name, ok := s.assetToCoin[asset]
+	return name, ok
+}
+
+// UnregisterAsset removes an asset index mapping. Used when multiple dexes
+// claim the same index — better to leave it unresolved than guess wrong.
+func (i *Info) UnregisterAsset(asset int) {
+	i.coinsWriteMu.Lock()
+	defer i.coinsWriteMu.Unlock()
+	cur := i.coins.Load()
+	name, ok := cur.assetToCoin[asset]
+	if !ok {
+		return
+	}
+	next := cur.clone()
+	delete(next.coinToAsset, name)
+	delete(next.assetToCoin, asset)
+	delete(next.assetToDecimal, asset)
+	i.coins.Store(next)
+}
+
+// ResolveCoin translates an asset-index symbol like "@107" to its coin name
+// (e.g. "ALT"). If the input doesn't start with "@" or the index is unknown,
+// the original string is returned unchanged.
+func (i *Info) ResolveCoin(symbol string) string {
+	if len(symbol) < 2 || symbol[0] != '@' {
+		return symbol
+	}
+	idx := 0
+	for _, c := range symbol[1:] {
+		if c < '0' || c > '9' {
+			return symbol
+		}
+		idx = idx*10 + int(c-'0')
+	}
+	if name, ok := i.coins.Load().assetToCoin[idx]; ok {
+		return name
+	}
+	return symbol
+}
+
+// UserState retrieves user's perpetuals account summary
+// If dex is empty string, returns state for the first perp dex (default)
+func (i *Info) UserState(ctx context.Context, address string, dex ...string) (*UserState, error) {
+	payload := map[string]any{
+		"type": "clearinghouseState",
+		"user": address,
+	}
+	if len(dex) > 0 && dex[0] != "" {
+		payload["dex"] = dex[0]
+	}
+
+	resp, err := i.client.post(ctx, "/info", payload)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch user state: %w", err)
+	}
+
+	var result UserState
+	if err := jUnmarshal(resp, &result); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal user state: %w", err)
+	}
+	return &result, nil
+}
+
+func (i *Info) SpotUserState(ctx context.Context, address string) (*SpotUserState, error) {
+	resp, err := i.client.post(ctx, "/info", map[string]any{
+		"type": "spotClearinghouseState",
+		"user": address,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch spot user state: %w", err)
+	}
+
+	var result SpotUserState
+	if err := jUnmarshal(resp, &result); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal spot user state: %w", err)
+	}
+	return &result, nil
+}
+
+// OpenOrders retrieves user's open orders
+// If dex is empty string, returns orders for the first perp dex (default)
+// Note: Spot open orders are only included with the first perp dex
+func (i *Info) OpenOrders(ctx context.Context, address string, dex ...string) ([]OpenOrder, error) {
+	payload := map[string]any{
+		"type": "openOrders",
+		"user": address,
+	}
+	if len(dex) > 0 && dex[0] != "" {
+		payload["dex"] = dex[0]
+	}
+
+	resp, err := i.client.post(ctx, "/info", payload)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch open orders: %w", err)
+	}
+
+	var result []OpenOrder
+	if err := jUnmarshal(resp, &result); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal open orders: %w", err)
+	}
+	return result, nil
+}
+
+// FrontendOpenOrders retrieves user's open orders with frontend info
+// If dex is empty string, returns orders for the first perp dex (default)
+// Note: Spot open orders are only included with the first perp dex
+func (i *Info) FrontendOpenOrders(
+	ctx context.Context,
+	address string,
+	dex ...string,
+) ([]FrontendOpenOrder, error) {
+	payload := map[string]any{
+		"type": "frontendOpenOrders",
+		"user": address,
+	}
+	if len(dex) > 0 && dex[0] != "" {
+		payload["dex"] = dex[0]
+	}
+
+	resp, err := i.client.post(ctx, "/info", payload)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch frontend open orders: %w", err)
+	}
+
+	var result []FrontendOpenOrder
+	if err := jUnmarshal(resp, &result); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal frontend open orders: %w", err)
+	}
+	return result, nil
+}
+
+// AllMids retrieves mids for all coins
+// If dex is empty string, returns mids for the first perp dex (default)
+// Note: Spot mids are only included with the first perp dex
+func (i *Info) AllMids(ctx context.Context, dex ...string) (map[string]string, error) {
+	payload := map[string]any{
+		"type": "allMids",
+	}
+	if len(dex) > 0 && dex[0] != "" {
+		payload["dex"] = dex[0]
+	}
+
+	resp, err := i.client.post(ctx, "/info", payload)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch all mids: %w", err)
+	}
+
+	var result map[string]string
+	if err := jUnmarshal(resp, &result); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal all mids: %w", err)
+	}
+	return result, nil
+}
+
+func (i *Info) UserFills(ctx context.Context, params UserFillsParams) ([]Fill, error) {
+	payload := map[string]any{
+		"type": "userFills",
+		"user": params.Address,
+	}
+	if params.AggregateByTime != nil {
+		payload["aggregateByTime"] = *params.AggregateByTime
+	}
+
+	resp, err := i.client.post(ctx, "/info", payload)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch user fills: %w", err)
+	}
+
+	var result []Fill
+	if err := jUnmarshal(resp, &result); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal user fills: %w", err)
+	}
+	return result, nil
+}
+
+func (i *Info) HistoricalOrders(ctx context.Context, address string) ([]OrderQueryResponse, error) {
+	resp, err := i.client.post(ctx, "/info", map[string]any{
+		"type": "historicalOrders",
+		"user": address,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch historical orders: %w", err)
+	}
+
+	var result []OrderQueryResponse
+	if err := jUnmarshal(resp, &result); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal historical orders: %w", err)
+	}
+	return result, nil
+}
+
+func (i *Info) UserFillsByTime(
+	ctx context.Context,
+	address string,
+	startTime int64,
+	endTime *int64,
+	aggregateByTime *bool,
+) ([]Fill, error) {
+	var extraParams = make(map[string]any, 0)
+	if aggregateByTime != nil {
+		extraParams["aggregateByTime"] = aggregateByTime
+	}
+
+	resp, err := i.postTimeRangeRequest(
+		ctx,
+		"userFillsByTime",
+		address,
+		startTime,
+		endTime,
+		extraParams,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	var result []Fill
+	if err := jUnmarshal(resp, &result); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal user fills by time: %w", err)
+	}
+	return result, nil
+}
+
+// MetaAndAssetCtxs retrieves perpetuals metadata and asset contexts
+// If params.Dex is nil or empty string, returns data for the first perp dex (default)
+func (i *Info) MetaAndAssetCtxs(
+	ctx context.Context,
+	params MetaAndAssetCtxsParams,
+) (*MetaAndAssetCtxs, error) {
+	// Internal payload struct with fixed Type field
+	payload := struct {
+		Type string  `json:"type"`
+		Dex  *string `json:"dex,omitempty"`
+	}{
+		Type: "metaAndAssetCtxs",
+		Dex:  params.Dex,
+	}
+
+	resp, err := i.client.post(ctx, "/info", payload)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch meta and asset contexts: %w", err)
+	}
+
+	var result []any
+	if err := jUnmarshal(resp, &result); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal meta and asset contexts: %w", err)
+	}
+
+	if len(result) < 2 {
+		return nil, fmt.Errorf("expected at least 2 elements in response, got %d", len(result))
+	}
+
+	metaBytes, err := jMarshal(result[0])
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal meta data: %w", err)
+	}
+
+	meta, err := parseMetaResponse(metaBytes)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse meta: %w", err)
+	}
+
+	ctxsBytes, err := jMarshal(result[1])
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal ctxs data: %w", err)
+	}
+
+	var ctxs []AssetCtx
+	if err := jUnmarshal(ctxsBytes, &ctxs); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal ctxs: %w", err)
+	}
+
+	metaAndAssetCtxs := &MetaAndAssetCtxs{
+		Meta: *meta,
+		Ctxs: ctxs,
+	}
+
+	return metaAndAssetCtxs, nil
+}
+
+func (i *Info) SpotMetaAndAssetCtxs(ctx context.Context) (*SpotMetaAndAssetCtxs, error) {
+	resp, err := i.client.post(ctx, "/info", map[string]any{
+		"type": "spotMetaAndAssetCtxs",
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch spot meta and asset contexts: %w", err)
+	}
+
+	var result []any
+	if err := jUnmarshal(resp, &result); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal spot meta and asset contexts: %w", err)
+	}
+
+	if len(result) < 2 {
+		return nil, fmt.Errorf("expected at least 2 elements in response, got %d", len(result))
+	}
+
+	// Unmarshal the first element (SpotMeta)
+	metaBytes, err := jMarshal(result[0])
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal meta data: %w", err)
+	}
+
+	var meta SpotMeta
+	if err := jUnmarshal(metaBytes, &meta); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal meta: %w", err)
+	}
+
+	// Unmarshal the second element ([]SpotAssetCtx)
+	ctxsBytes, err := jMarshal(result[1])
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal ctxs data: %w", err)
+	}
+
+	var ctxs []SpotAssetCtx
+	if err := jUnmarshal(ctxsBytes, &ctxs); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal ctxs: %w", err)
+	}
+
+	return &SpotMetaAndAssetCtxs{
+		Meta: meta,
+		Ctxs: ctxs,
+	}, nil
+}
+
+func (i *Info) FundingHistory(
+	ctx context.Context,
+	name string,
+	startTime int64,
+	endTime *int64,
+) ([]FundingHistory, error) {
+	resp, err := i.postTimeRangeRequest(
+		ctx,
+		"fundingHistory",
+		"",
+		startTime,
+		endTime,
+		map[string]any{"coin": name},
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	var result []FundingHistory
+	if err := jUnmarshal(resp, &result); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal funding history: %w", err)
+	}
+	return result, nil
+}
+
+func (i *Info) UserFundingHistory(
+	ctx context.Context,
+	user string,
+	startTime int64,
+	endTime *int64,
+) ([]UserFundingHistory, error) {
+	resp, err := i.postTimeRangeRequest(ctx, "userFunding", user, startTime, endTime, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	var result []UserFundingHistory
+	if err := jUnmarshal(resp, &result); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal user funding history: %w", err)
+	}
+	return result, nil
+}
+
+func (i *Info) UserNonFundingLedgerUpdates(
+	ctx context.Context,
+	user string,
+	startTime int64,
+	endTime *int64,
+) ([]UserNonFundingLedgerUpdates, error) {
+	resp, err := i.postTimeRangeRequest(
+		ctx,
+		"userNonFundingLedgerUpdates",
+		user,
+		startTime,
+		endTime,
+		nil,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	var result []UserNonFundingLedgerUpdates
+	if err := jUnmarshal(resp, &result); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal user non-funding ledger updates: %w", err)
+	}
+	return result, nil
+}
+
+func (i *Info) L2Snapshot(ctx context.Context, name string) (*L2Book, error) {
+	resp, err := i.client.post(ctx, "/info", map[string]any{
+		"type": "l2Book",
+		"coin": name,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch L2 snapshot: %w", err)
+	}
+
+	var result L2Book
+	if err := jUnmarshal(resp, &result); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal L2 snapshot: %w", err)
+	}
+	return &result, nil
+}
+
+func (i *Info) CandlesSnapshot(
+	ctx context.Context,
+	name, interval string,
+	startTime, endTime int64,
+) ([]Candle, error) {
+	req := map[string]any{
+		"coin":      name,
+		"interval":  interval,
+		"startTime": startTime,
+		"endTime":   endTime,
+	}
+
+	resp, err := i.client.post(ctx, "/info", map[string]any{
+		"type": "candleSnapshot",
+		"req":  req,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch candles snapshot: %w", err)
+	}
+
+	var result []Candle
+	if err := jUnmarshal(resp, &result); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal candles snapshot: %w", err)
+	}
+	return result, nil
+}
+
+func (i *Info) UserFees(ctx context.Context, address string) (*UserFees, error) {
+	resp, err := i.client.post(ctx, "/info", map[string]any{
+		"type": "userFees",
+		"user": address,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch user fees: %w", err)
+	}
+
+	var result UserFees
+	if err := jUnmarshal(resp, &result); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal user fees: %w", err)
+	}
+	return &result, nil
+}
+
+// UserRateLimit retrieves an address's L1 action allowance and how much of it
+// has been spent. An address that has never traded answers with cap 10000 and
+// used 0, not an error.
+//
+// A null body has been observed and decodes to a zero-valued struct, so
+// NRequestsCap == 0 means UNKNOWN, never "no allowance".
+func (i *Info) UserRateLimit(ctx context.Context, address string) (*UserRateLimit, error) {
+	resp, err := i.client.post(ctx, "/info", map[string]any{
+		"type": "userRateLimit",
+		"user": address,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch user rate limit: %w", err)
+	}
+
+	var result UserRateLimit
+	if err := jUnmarshal(resp, &result); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal user rate limit: %w", err)
+	}
+	return &result, nil
+}
+
+func (i *Info) UserActiveAssetData(
+	ctx context.Context,
+	address string,
+	coin string,
+) (*UserActiveAssetData, error) {
+	resp, err := i.client.post(ctx, "/info", map[string]any{
+		"type": "activeAssetData",
+		"user": address,
+		"coin": coin,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch user active asset data: %w", err)
+	}
+
+	var result UserActiveAssetData
+	if err := jUnmarshal(resp, &result); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal user active asset data: %w", err)
+	}
+	return &result, nil
+}
+
+func (i *Info) UserStakingSummary(ctx context.Context, address string) (*StakingSummary, error) {
+	resp, err := i.client.post(ctx, "/info", map[string]any{
+		"type": "delegatorSummary",
+		"user": address,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch staking summary: %w", err)
+	}
+
+	var result StakingSummary
+	if err := jUnmarshal(resp, &result); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal staking summary: %w", err)
+	}
+	return &result, nil
+}
+
+func (i *Info) UserStakingDelegations(
+	ctx context.Context,
+	address string,
+) ([]StakingDelegation, error) {
+	resp, err := i.client.post(ctx, "/info", map[string]any{
+		"type": "delegations",
+		"user": address,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch staking delegations: %w", err)
+	}
+
+	var result []StakingDelegation
+	if err := jUnmarshal(resp, &result); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal staking delegations: %w", err)
+	}
+	return result, nil
+}
+
+func (i *Info) UserStakingRewards(ctx context.Context, address string) ([]StakingReward, error) {
+	resp, err := i.client.post(ctx, "/info", map[string]any{
+		"type": "delegatorRewards",
+		"user": address,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch staking rewards: %w", err)
+	}
+
+	var result []StakingReward
+	if err := jUnmarshal(resp, &result); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal staking rewards: %w", err)
+	}
+	return result, nil
+}
+
+func (i *Info) QueryOrderByOid(
+	ctx context.Context,
+	user string,
+	oid int64,
+) (*OrderQueryResult, error) {
+	resp, err := i.client.post(ctx, "/info", map[string]any{
+		"type": "orderStatus",
+		"user": user,
+		"oid":  oid,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch order status: %w", err)
+	}
+
+	var result OrderQueryResult
+	if err := jUnmarshal(resp, &result); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal order status: %w", err)
+	}
+	return &result, nil
+}
+
+func (i *Info) QueryOrderByCloid(
+	ctx context.Context,
+	user, cloid string,
+) (*OrderQueryResult, error) {
+	resp, err := i.client.post(ctx, "/info", map[string]any{
+		"type": "orderStatus",
+		"user": user,
+		"oid":  cloid,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch order status by cloid: %w", err)
+	}
+
+	var result OrderQueryResult
+	if err := jUnmarshal(resp, &result); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal order status: %w", err)
+	}
+	return &result, nil
+}
+
+func (i *Info) QueryReferralState(ctx context.Context, user string) (*ReferralState, error) {
+	resp, err := i.client.post(ctx, "/info", map[string]any{
+		"type": "referral",
+		"user": user,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch referral state: %w", err)
+	}
+
+	var result ReferralState
+	if err := jUnmarshal(resp, &result); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal referral state: %w", err)
+	}
+	return &result, nil
+}
+
+func (i *Info) QuerySubAccounts(ctx context.Context, user string) ([]SubAccount, error) {
+	resp, err := i.client.post(ctx, "/info", map[string]any{
+		"type": "subAccounts",
+		"user": user,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch sub accounts: %w", err)
+	}
+
+	var result []SubAccount
+	if err := jUnmarshal(resp, &result); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal sub accounts: %w", err)
+	}
+	return result, nil
+}
+
+func (i *Info) QueryUserToMultiSigSigners(
+	ctx context.Context,
+	multiSigUser string,
+) ([]MultiSigSigner, error) {
+	resp, err := i.client.post(ctx, "/info", map[string]any{
+		"type": "userToMultiSigSigners",
+		"user": multiSigUser,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch multi-sig signers: %w", err)
+	}
+
+	var result []MultiSigSigner
+	if err := jUnmarshal(resp, &result); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal multi-sig signers: %w", err)
+	}
+	return result, nil
+}
+
+// PerpDexs returns the list of available perpetual dexes
+// Returns an array where each element can be nil (for the default dex) or a PerpDex object
+// The first element is always null (representing the default dex)
+func (i *Info) PerpDexs(ctx context.Context) (MixedArray, error) {
+	resp, err := i.client.post(ctx, "/info", map[string]any{
+		"type": "perpDexs",
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch perp dexs: %w", err)
+	}
+
+	var result MixedArray
+	if err := jUnmarshal(resp, &result); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal perp dexs: %w", err)
+	}
+	return result, nil
+}
+
+func (i *Info) TokenDetails(ctx context.Context, tokenId string) (*TokenDetail, error) {
+	resp, err := i.client.post(ctx, "/info", map[string]any{
+		"type":    "tokenDetails",
+		"tokenId": tokenId,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch token detail: %w", err)
+	}
+
+	var tokenDetail TokenDetail
+	if err := jUnmarshal(resp, &tokenDetail); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal token detail response: %w", err)
+	}
+
+	return &tokenDetail, nil
+}
+
+// PerpDexLimits retrieves builder-deployed perp market limits
+// dex must be a non-empty string (the empty string is not allowed for this endpoint)
+func (i *Info) PerpDexLimits(ctx context.Context, dex string) (*PerpDexLimits, error) {
+	if dex == "" {
+		return nil, fmt.Errorf("dex parameter is required for perpDexLimits")
+	}
+
+	resp, err := i.client.post(ctx, "/info", map[string]any{
+		"type": "perpDexLimits",
+		"dex":  dex,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch perp dex limits: %w", err)
+	}
+
+	var result PerpDexLimits
+	if err := jUnmarshal(resp, &result); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal perp dex limits: %w", err)
+	}
+	return &result, nil
+}
+
+// PerpDexStatus retrieves perp market status
+// If dex is empty string, returns status for the first perp dex (default)
+func (i *Info) PerpDexStatus(ctx context.Context, dex string) (*PerpDexStatus, error) {
+	payload := map[string]any{
+		"type": "perpDexStatus",
+	}
+	if dex != "" {
+		payload["dex"] = dex
+	}
+
+	resp, err := i.client.post(ctx, "/info", payload)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch perp dex status: %w", err)
+	}
+
+	var result PerpDexStatus
+	if err := jUnmarshal(resp, &result); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal perp dex status: %w", err)
+	}
+	return &result, nil
+}
+
+// PerpDeployAuctionStatus retrieves information about the Perp Deploy Auction
+func (i *Info) PerpDeployAuctionStatus(ctx context.Context) (*PerpDeployAuctionStatus, error) {
+	resp, err := i.client.post(ctx, "/info", map[string]any{
+		"type": "perpDeployAuctionStatus",
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch perp deploy auction status: %w", err)
+	}
+
+	var result PerpDeployAuctionStatus
+	if err := jUnmarshal(resp, &result); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal perp deploy auction status: %w", err)
+	}
+	return &result, nil
+}
+
+// portfolio returns the user's portfolio
+func (i *Info) Portfolio(ctx context.Context, user string) ([]Portfolio, error) {
+	resp, err := i.client.post(ctx, "/info", map[string]any{
+		"type": "portfolio",
+		"user": user,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch portfolio: %w", err)
+	}
+
+	var result []Portfolio
+	if err := jUnmarshal(resp, &result); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal portfolio: %w", err)
+	}
+	return result, nil
+}
+
+// MaxBuilderFee retrieves the maximum builder fee approved by user for builder.
+// Returns the fee in tenths of a basis point (e.g. 1 = 0.001%).
+func (i *Info) MaxBuilderFee(ctx context.Context, user, builder string) (int, error) {
+	resp, err := i.client.post(ctx, "/info", map[string]any{
+		"type":    "maxBuilderFee",
+		"user":    user,
+		"builder": builder,
+	})
+	if err != nil {
+		return 0, fmt.Errorf("failed to fetch max builder fee: %w", err)
+	}
+
+	var result int
+	if err := jUnmarshal(resp, &result); err != nil {
+		return 0, fmt.Errorf("failed to unmarshal max builder fee: %w", err)
+	}
+	return result, nil
+}
+
+// UserAbstraction retrieves the account abstraction mode for a user.
+// Returns one of: "default", "disabled", "unifiedAccount", "portfolioMargin", "dexAbstraction".
+func (i *Info) UserAbstraction(ctx context.Context, user string) (AbstractionMode, error) {
+	resp, err := i.client.post(ctx, "/info", map[string]any{
+		"type": "userAbstraction",
+		"user": user,
+	})
+	if err != nil {
+		return "", fmt.Errorf("failed to fetch user abstraction: %w", err)
+	}
+
+	var result AbstractionMode
+	if err := jUnmarshal(resp, &result); err != nil {
+		return "", fmt.Errorf("failed to unmarshal user abstraction: %w", err)
+	}
+	return result, nil
+}

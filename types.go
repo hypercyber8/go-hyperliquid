@@ -1,0 +1,904 @@
+package hyperliquid
+
+import (
+	"encoding/json"
+	"time"
+
+	"github.com/shopspring/decimal"
+)
+
+//go:generate easyjson -all
+
+type Side string
+
+const (
+	SideAsk Side = "A"
+	SideBid Side = "B"
+)
+
+type Grouping string
+
+const (
+	GroupingNA           Grouping = "na"
+	GroupingNormalTpsl   Grouping = "normalTpsl"
+	GroupingPositionTpls Grouping = "positionTpsl"
+)
+
+// Constants for default values
+const (
+	DefaultSlippage = 0.05 // 5%
+)
+
+type Tif string
+
+// Order Time-in-Force constants
+const (
+	// Add Liquidity Only
+	TifAlo Tif = "Alo"
+	// Immediate or Cancel
+	TifIoc Tif = "Ioc"
+	// Good Till Cancel
+	TifGtc Tif = "Gtc"
+)
+
+type Tpsl string // Advanced order type
+
+const (
+	TakeProfit Tpsl = "tp"
+	StopLoss   Tpsl = "sl"
+)
+
+type AssetInfo struct {
+	Name          string `json:"name"`
+	SzDecimals    int    `json:"szDecimals"`
+	MaxLeverage   int    `json:"maxLeverage"`
+	MarginTableId int    `json:"marginTableId"`
+	OnlyIsolated  bool   `json:"onlyIsolated"`
+	IsDelisted    bool   `json:"isDelisted"`
+}
+
+type MarginTier struct {
+	LowerBound  string `json:"lowerBound"`
+	MaxLeverage int    `json:"maxLeverage"`
+}
+
+type MarginTable struct {
+	ID          int
+	Description string       `json:"description"`
+	MarginTiers []MarginTier `json:"marginTiers"`
+}
+
+type Meta struct {
+	Universe        []AssetInfo   `json:"universe"`
+	MarginTables    []MarginTable `json:"marginTables"`
+	CollateralToken int           `json:"collateralToken"`
+}
+
+type AssetCtx struct {
+	Funding      string   `json:"funding"`
+	OpenInterest string   `json:"openInterest"`
+	PrevDayPx    string   `json:"prevDayPx"`
+	DayNtlVlm    string   `json:"dayNtlVlm"`
+	Premium      string   `json:"premium"`
+	OraclePx     string   `json:"oraclePx"`
+	MarkPx       string   `json:"markPx"`
+	MidPx        string   `json:"midPx,omitempty"`
+	ImpactPxs    []string `json:"impactPxs"`
+	DayBaseVlm   string   `json:"dayBaseVlm,omitempty"`
+}
+
+// MetaAndAssetCtxsParams contains optional parameters for MetaAndAssetCtxs request
+type MetaAndAssetCtxsParams struct {
+	// Dex specifies the DEX to query. If nil or empty string, queries the default (first) perp dex.
+	Dex *string
+}
+
+// This type has no JSON annotation because it cannot be directly unmarshalled from the response
+type MetaAndAssetCtxs struct {
+	Meta
+	Ctxs []AssetCtx
+}
+
+type SpotAssetInfo struct {
+	Name        string `json:"name"`
+	Tokens      []int  `json:"tokens"`
+	Index       int    `json:"index"`
+	IsCanonical bool   `json:"isCanonical"`
+}
+
+type EvmContract struct {
+	Address             string `json:"address"`
+	EvmExtraWeiDecimals int    `json:"evm_extra_wei_decimals"`
+}
+
+type SpotTokenInfo struct {
+	Name        string       `json:"name"`
+	SzDecimals  int          `json:"szDecimals"`
+	WeiDecimals int          `json:"weiDecimals"`
+	Index       int          `json:"index"`
+	TokenID     string       `json:"tokenId"`
+	IsCanonical bool         `json:"isCanonical"`
+	EvmContract *EvmContract `json:"evmContract"`
+	FullName    *string      `json:"fullName"`
+}
+
+type SpotMeta struct {
+	Universe []SpotAssetInfo `json:"universe"`
+	Tokens   []SpotTokenInfo `json:"tokens"`
+}
+
+type SpotAssetCtx struct {
+	DayNtlVlm         string  `json:"dayNtlVlm"`
+	MarkPx            string  `json:"markPx"`
+	MidPx             *string `json:"midPx"`
+	PrevDayPx         string  `json:"prevDayPx"`
+	CirculatingSupply string  `json:"circulatingSupply"`
+	Coin              string  `json:"coin"`
+}
+
+// This type has no JSON annotation because it cannot be directly unmarshalled from the response
+type SpotMetaAndAssetCtxs struct {
+	Meta SpotMeta
+	Ctxs []SpotAssetCtx
+}
+
+// WsMsg represents a WebSocket message with a channel and data payload.
+type WsMsg struct {
+	Channel string         `json:"channel"`
+	Data    map[string]any `json:"data"`
+}
+
+type OrderType struct {
+	Limit   *LimitOrderType   `json:"limit,omitempty"`
+	Trigger *TriggerOrderType `json:"trigger,omitempty"`
+}
+
+type LimitOrderType struct {
+	Tif Tif `json:"tif"` // TifAlo, TifIoc, TifGtc
+}
+
+type TriggerOrderType struct {
+	TriggerPx float64 `json:"triggerPx" msgpack:"triggerPx"`
+	IsMarket  bool    `json:"isMarket"  msgpack:"isMarket"`
+	Tpsl      Tpsl    `json:"tpsl"      msgpack:"tpsl"` // "tp" or "sl"
+}
+
+type BuilderInfo struct {
+	Builder string `json:"b" msgpack:"b"`
+	Fee     int    `json:"f" msgpack:"f"`
+}
+
+type CancelRequest struct {
+	Coin string `json:"coin"`
+	Oid  int64  `json:"oid"`
+}
+
+type CancelByCloidRequest struct {
+	Coin  string `json:"coin"`
+	Cloid string `json:"cloid"`
+}
+
+type Cloid struct {
+	Value string
+}
+
+func (c Cloid) ToRaw() string {
+	return c.Value
+}
+
+type PerpDexSchemaInput struct {
+	FullName        string  `json:"fullName"`
+	CollateralToken int     `json:"collateralToken"`
+	OracleUpdater   *string `json:"oracleUpdater"`
+}
+
+type AssetPosition struct {
+	Position Position `json:"position"`
+	Type     string   `json:"type"`
+}
+
+type Position struct {
+	Coin           string           `json:"coin"`
+	EntryPx        *decimal.Decimal `json:"entryPx"`
+	Leverage       Leverage         `json:"leverage"`
+	LiquidationPx  *decimal.Decimal `json:"liquidationPx"`
+	MarginUsed     decimal.Decimal  `json:"marginUsed"`
+	PositionValue  decimal.Decimal  `json:"positionValue"`
+	ReturnOnEquity decimal.Decimal  `json:"returnOnEquity"`
+	Szi            decimal.Decimal  `json:"szi"`
+	UnrealizedPnl  decimal.Decimal  `json:"unrealizedPnl"`
+	CumFunding     *CumFunding      `json:"cumFunding,omitempty"`
+}
+
+type Leverage struct {
+	Type   string  `json:"type"`
+	Value  int     `json:"value"`
+	RawUsd *string `json:"rawUsd,omitempty"`
+}
+
+type CumFunding struct {
+	AllTime     string `json:"allTime"`
+	SinceChange string `json:"sinceChange"`
+	SinceOpen   string `json:"sinceOpen"`
+}
+
+type UserState struct {
+	AssetPositions     []AssetPosition `json:"assetPositions"`
+	CrossMarginSummary MarginSummary   `json:"crossMarginSummary"`
+	MarginSummary      MarginSummary   `json:"marginSummary"`
+	Withdrawable       string          `json:"withdrawable"`
+}
+
+type SpotBalance struct {
+	Coin     string `json:"coin"`
+	Token    int    `json:"token"`
+	Hold     string `json:"hold"`
+	Total    string `json:"total"`
+	EntryNtl string `json:"entryNtl"`
+	// Borrowed is the outstanding borrow on this token under portfolio
+	// margin (USD-denominated string). Present only on portfolioMargin
+	// accounts with an active borrow; absent (empty) otherwise. The custom
+	// easyjson decoder parses this; it is intentionally not emitted by the
+	// generated encoder since we never marshal SpotBalance back out.
+	Borrowed string `json:"borrowed,omitempty"`
+}
+
+type SpotUserState struct {
+	Balances []SpotBalance `json:"balances"`
+}
+
+type MarginSummary struct {
+	AccountValue    decimal.Decimal `json:"accountValue"`
+	TotalMarginUsed decimal.Decimal `json:"totalMarginUsed"`
+	TotalNtlPos     decimal.Decimal `json:"totalNtlPos"`
+	TotalRawUsd     decimal.Decimal `json:"totalRawUsd"`
+}
+
+type OpenOrder struct {
+	Coin      string  `json:"coin"`
+	Cloid     *string `json:"cloid,omitempty"`
+	LimitPx   float64 `json:"limitPx,string"`
+	Oid       int64   `json:"oid"`
+	OrigSz    float64 `json:"origSz,string"`
+	Side      string  `json:"side"`
+	Size      float64 `json:"sz,string"`
+	Timestamp int64   `json:"timestamp"`
+}
+
+type FrontendOpenOrder struct {
+	Coin             string    `json:"coin"`
+	IsPositionTpSl   bool      `json:"isPositionTpsl"`
+	IsTrigger        bool      `json:"isTrigger"`
+	LimitPx          float64   `json:"limitPx,string"`
+	Oid              int64     `json:"oid"`
+	OrderType        string    `json:"orderType"`
+	OrigSz           float64   `json:"origSz,string"`
+	ReduceOnly       bool      `json:"reduceOnly"`
+	Side             OrderSide `json:"side"`
+	Sz               float64   `json:"sz,string"`
+	Timestamp        int64     `json:"timestamp"`
+	TriggerCondition string    `json:"triggerCondition"`
+	TriggerPx        float64   `json:"triggerPx,string"`
+}
+
+type OrderSide string
+
+const (
+	OrderSideAsk OrderSide = "A"
+	OrderSideBid OrderSide = "B"
+)
+
+type QueriedOrder struct {
+	Coin             string         `json:"coin"`
+	Side             OrderSide      `json:"side"`
+	LimitPx          string         `json:"limitPx"`
+	Sz               string         `json:"sz"`
+	Oid              int64          `json:"oid"`
+	Timestamp        int64          `json:"timestamp"`
+	TriggerCondition string         `json:"triggerCondition"`
+	IsTrigger        bool           `json:"isTrigger"`
+	TriggerPx        string         `json:"triggerPx"`
+	Children         []QueriedOrder `json:"children"`
+	IsPositionTpsl   bool           `json:"isPositionTpsl"`
+	ReduceOnly       bool           `json:"reduceOnly"`
+	OrderType        string         `json:"orderType"`
+	OrigSz           string         `json:"origSz"`
+	Tif              Tif            `json:"tif"`
+	Cloid            *string        `json:"cloid"`
+}
+
+type OrderQueryResponse struct {
+	Order           QueriedOrder     `json:"order"`
+	Status          OrderStatusValue `json:"status"`
+	StatusTimestamp int64            `json:"statusTimestamp"`
+}
+
+type OrderStatusValue string
+
+const (
+	// Placed successfully
+	OrderStatusValueOpen OrderStatusValue = "open"
+	// Filled
+	OrderStatusValueFilled OrderStatusValue = "filled"
+	// Canceled by user
+	OrderStatusValueCanceled OrderStatusValue = "canceled"
+	// Trigger order triggered
+	OrderStatusValueTriggered OrderStatusValue = "triggered"
+	// Rejected at time of placement
+	OrderStatusValueRejected OrderStatusValue = "rejected"
+	// Canceled because insufficient margin to fill
+	OrderStatusValueMarginCanceled OrderStatusValue = "marginCanceled"
+	// Vaults only. Canceled due to a user's withdrawal from vault
+	OrderStatusValueVaultWithdrawalCanceled OrderStatusValue = "vaultWithdrawalCanceled"
+	// Canceled due to order being too aggressive when open interest was at cap
+	OrderStatusValueOpenInterestCapCanceled OrderStatusValue = "openInterestCapCanceled"
+	// Canceled due to self-trade prevention
+	OrderStatusValueSelfTradeCanceled OrderStatusValue = "selfTradeCanceled"
+	// Canceled reduced-only order that does not reduce position
+	OrderStatusValueReduceOnlyCanceled OrderStatusValue = "reduceOnlyCanceled"
+	// TP/SL only. Canceled due to sibling ordering being filled
+	OrderStatusValueSiblingFilledCanceled OrderStatusValue = "siblingFilledCanceled"
+	// Canceled due to asset delisting
+	OrderStatusValueDelistedCanceled OrderStatusValue = "delistedCanceled"
+	// Canceled due to liquidation
+	OrderStatusValueLiquidatedCanceled OrderStatusValue = "liquidatedCanceled"
+	// API only. Canceled due to exceeding scheduled cancel deadline (dead man's switch)
+	OrderStatusValueScheduledCancel OrderStatusValue = "scheduledCancel"
+	// Rejected due to invalid tick price
+	OrderStatusValueTickRejected OrderStatusValue = "tickRejected"
+	// Rejected due to order notional below minimum
+	OrderStatusValueMinTradeNtlRejected OrderStatusValue = "minTradeNtlRejected"
+	// Rejected due to insufficient margin
+	OrderStatusValuePerpMarginRejected OrderStatusValue = "perpMarginRejected"
+	// Rejected due to reduce only
+	OrderStatusValueReduceOnlyRejected OrderStatusValue = "reduceOnlyRejected"
+	// Rejected due to post-only immediate match
+	OrderStatusValueBadAloPxRejected OrderStatusValue = "badAloPxRejected"
+	// Rejected due to IOC not able to match
+	OrderStatusValueIocCancelRejected OrderStatusValue = "iocCancelRejected"
+	// Rejected due to invalid TP/SL price
+	OrderStatusValueBadTriggerPxRejected OrderStatusValue = "badTriggerPxRejected"
+	// Rejected due to lack of liquidity for market order
+	OrderStatusValueMarketOrderNoLiquidityRejected OrderStatusValue = "marketOrderNoLiquidityRejected"
+	// Rejected due to open interest cap
+	OrderStatusValuePositionIncreaseAtOpenInterestCapRejected OrderStatusValue = "positionIncreaseAtOpenInterestCapRejected"
+	// Rejected due to open interest cap
+	OrderStatusValuePositionFlipAtOpenInterestCapRejected OrderStatusValue = "positionFlipAtOpenInterestCapRejected"
+	// Rejected due to price too aggressive at open interest cap
+	OrderStatusValueTooAggressiveAtOpenInterestCapRejected OrderStatusValue = "tooAggressiveAtOpenInterestCapRejected"
+	// Rejected due to open interest cap
+	OrderStatusValueOpenInterestIncreaseRejected OrderStatusValue = "openInterestIncreaseRejected"
+	// Rejected due to insufficient spot balance
+	OrderStatusValueInsufficientSpotBalanceRejected OrderStatusValue = "insufficientSpotBalanceRejected"
+	// Rejected due to price too far from oracle
+	OrderStatusValueOracleRejected OrderStatusValue = "oracleRejected"
+	// Rejected due to exceeding margin tier limit at current leverage
+	OrderStatusValuePerpMaxPositionRejected OrderStatusValue = "perpMaxPositionRejected"
+)
+
+type OrderQueryStatus string
+
+const (
+	OrderQueryStatusSuccess OrderQueryStatus = "order"
+	OrderQueryStatusError   OrderQueryStatus = "unknownOid"
+)
+
+type OrderQueryResult struct {
+	Status OrderQueryStatus   `json:"status"`
+	Order  OrderQueryResponse `json:"order,omitempty"`
+}
+
+type Fill struct {
+	ClosedPnl     string `json:"closedPnl"`
+	Coin          string `json:"coin"`
+	Crossed       bool   `json:"crossed"`
+	Dir           string `json:"dir"`
+	Hash          string `json:"hash"`
+	Oid           int64  `json:"oid"`
+	Price         string `json:"px"`
+	Side          string `json:"side"`
+	StartPosition string `json:"startPosition"`
+	Size          string `json:"sz"`
+	Time          int64  `json:"time"`
+	Fee           string `json:"fee"`
+	FeeToken      string `json:"feeToken"`
+	BuilderFee    string `json:"builderFee,omitempty"`
+	Tid           int64  `json:"tid"`
+}
+
+type UserFillsParams struct {
+	Address         string
+	AggregateByTime *bool
+}
+
+type FundingHistory struct {
+	Coin        string `json:"coin"`
+	FundingRate string `json:"fundingRate"`
+	Premium     string `json:"premium"`
+	Time        int64  `json:"time"`
+}
+
+type UserFundingHistory struct {
+	Delta Delta  `json:"delta"`
+	Hash  string `json:"hash"`
+	Time  int64  `json:"time"`
+}
+
+type Delta struct {
+	Coin        string `json:"coin"`
+	FundingRate string `json:"fundingRate"`
+	Size        string `json:"size"`
+	Type        string `json:"type"`
+	USDC        string `json:"usdc"`
+}
+
+type UserNonFundingLedgerUpdates struct {
+	Delta LedgerDelta `json:"delta"`
+	Hash  string      `json:"hash"`
+	Time  int64       `json:"time"`
+}
+
+// LedgerDelta is the union of every variant HL emits on
+// userNonFundingLedgerUpdates. Each variant only populates a subset;
+// every absent field decodes as its zero value (empty string / nil
+// pointer). usdc is for variants denominated in USDC; usdcValue is
+// the USDC-equivalent reported alongside a token+amount on token
+// transfers (send / spotTransfer).
+type LedgerDelta struct {
+	Type           string `json:"type"`
+	USDC           string `json:"usdc"`
+	UsdcValue      string `json:"usdcValue"`
+	User           string `json:"user"`
+	Destination    string `json:"destination"`
+	Fee            string `json:"fee"`
+	FeeToken       string `json:"feeToken"`
+	NativeTokenFee string `json:"nativeTokenFee"`
+	Token          string `json:"token"`
+	Amount         string `json:"amount"`
+	SourceDex      string `json:"sourceDex"`
+	DestinationDex string `json:"destinationDex"`
+	Vault          string `json:"vault"`
+	Nonce          *int64 `json:"nonce"`
+	ToPerp         *bool  `json:"toPerp"`
+}
+
+// UserRateLimit is an address's L1 action allowance. HL grants 10000 requests
+// plus one per USDC of cumulative volume traded, counts a batch of n actions as
+// n, and throttles an address past its cap to roughly one action per ten
+// seconds. Cancels get a higher ceiling of min(cap+100000, cap*2).
+type UserRateLimit struct {
+	CumVlm           string `json:"cumVlm"`
+	NRequestsUsed    int64  `json:"nRequestsUsed"`
+	NRequestsCap     int64  `json:"nRequestsCap"`
+	NRequestsSurplus int64  `json:"nRequestsSurplus"`
+}
+
+type UserFees struct {
+	ActiveReferralDiscount string       `json:"activeReferralDiscount"`
+	DailyUserVolume        []UserVolume `json:"dailyUserVlm"`
+	FeeSchedule            FeeSchedule  `json:"feeSchedule"`
+	UserAddRate            string       `json:"userAddRate"`
+	UserCrossRate          string       `json:"userCrossRate"`
+	UserSpotCrossRate      string       `json:"userSpotCrossRate"`
+	UserSpotAddRate        string       `json:"userSpotAddRate"`
+}
+
+type UserActiveAssetData struct {
+	User             string   `json:"user"`
+	Coin             string   `json:"coin"`
+	Leverage         Leverage `json:"leverage"`
+	MaxTradeSzs      []string `json:"maxTradeSzs"`
+	AvailableToTrade []string `json:"availableToTrade"`
+	MarkPx           string   `json:"markPx"`
+}
+
+type UserVolume struct {
+	Date      string `json:"date"`
+	Exchange  string `json:"exchange"`
+	UserAdd   string `json:"userAdd"`
+	UserCross string `json:"userCross"`
+}
+
+type FeeSchedule struct {
+	Add              string `json:"add"`
+	Cross            string `json:"cross"`
+	ReferralDiscount string `json:"referralDiscount"`
+	Tiers            Tiers  `json:"tiers"`
+}
+
+type Tiers struct {
+	MM  []MMTier  `json:"mm"`
+	VIP []VIPTier `json:"vip"`
+}
+
+type MMTier struct {
+	Add                 string `json:"add"`
+	MakerFractionCutoff string `json:"makerFractionCutoff"`
+}
+
+type VIPTier struct {
+	Add       string `json:"add"`
+	Cross     string `json:"cross"`
+	NtlCutoff string `json:"ntlCutoff"`
+}
+
+type StakingSummary struct {
+	Delegated              string `json:"delegated"`
+	Undelegated            string `json:"undelegated"`
+	TotalPendingWithdrawal string `json:"totalPendingWithdrawal"`
+	NPendingWithdrawals    int    `json:"nPendingWithdrawals"`
+}
+
+type StakingDelegation struct {
+	Validator            string `json:"validator"`
+	Amount               string `json:"amount"`
+	LockedUntilTimestamp int64  `json:"lockedUntilTimestamp"`
+}
+
+type StakingReward struct {
+	Time        int64  `json:"time"`
+	Source      string `json:"source"`
+	TotalAmount string `json:"totalAmount"`
+}
+
+type ReferralState struct {
+	ReferralCode string         `json:"referralCode"`
+	Referrer     string         `json:"referrer"`
+	Referred     []string       `json:"referred"`
+	ReferredBy   *ReferredByRef `json:"referredBy,omitempty"`
+	CumVlm       string         `json:"cumVlm"`
+}
+
+// ReferredByRef is the inviter info for a user that signed up under
+// someone else's referral code. Empty (nil) when the user has not been
+// referred by anyone.
+type ReferredByRef struct {
+	Code     string `json:"code"`
+	Referrer string `json:"referrer"`
+}
+
+type SubAccount struct {
+	Name        string   `json:"name"`
+	User        string   `json:"user"`
+	Permissions []string `json:"permissions"`
+}
+
+type MultiSigSigner struct {
+	User      string `json:"user"`
+	Threshold int    `json:"threshold"`
+}
+
+type BulkOrderResponse struct {
+	Status string        `json:"status"`
+	Data   []OrderStatus `json:"data,omitempty"`
+	Error  string        `json:"error,omitempty"`
+}
+
+type CancelResponse struct {
+	Status string     `json:"status"`
+	Data   *OpenOrder `json:"data,omitempty"`
+	Error  string     `json:"error,omitempty"`
+}
+
+type BulkCancelResponse struct {
+	Status string      `json:"status"`
+	Data   []OpenOrder `json:"data,omitempty"`
+	Error  string      `json:"error,omitempty"`
+}
+
+type ModifyResponse struct {
+	Status string        `json:"status"`
+	Data   []OrderStatus `json:"data,omitempty"`
+	Error  string        `json:"error,omitempty"`
+}
+
+type TransferResponse struct {
+	Status   string          `json:"status"`
+	TxHash   string          `json:"txHash,omitempty"`
+	Error    string          `json:"error,omitempty"`
+	Response json.RawMessage `json:"response,omitempty"`
+}
+
+type ApprovalResponse struct {
+	Status   string          `json:"status"`
+	TxHash   string          `json:"txHash,omitempty"`
+	Error    string          `json:"error,omitempty"`
+	Response json.RawMessage `json:"response,omitempty"`
+}
+
+type CreateVaultResponse struct {
+	Status string `json:"status"`
+	Data   string `json:"data,omitempty"`
+	Error  string `json:"error,omitempty"`
+}
+
+type CreateSubAccountResponse struct {
+	Status string      `json:"status"`
+	Data   *SubAccount `json:"data,omitempty"`
+	Error  string      `json:"error,omitempty"`
+}
+
+type SetReferrerResponse struct {
+	Status string `json:"status"`
+	Error  string `json:"error,omitempty"`
+}
+
+type ScheduleCancelResponse struct {
+	Status string `json:"status"`
+	Error  string `json:"error,omitempty"`
+}
+
+// ReserveResponseData represents the parsed success data from a reserve request weight action.
+type ReserveResponseData struct {
+	Type string `json:"type"`
+}
+type ReserveRequestWeightResponse struct {
+	Status   string               `json:"status"`
+	Response *ReserveResponseData `json:"response,omitempty"`
+	Error    string               `json:"error,omitempty"`
+}
+
+type AgentApprovalResponse struct {
+	Status string `json:"status"`
+	TxHash string `json:"txHash,omitempty"`
+	Error  string `json:"error,omitempty"`
+}
+
+type MultiSigConversionResponse struct {
+	Status string `json:"status"`
+	TxHash string `json:"txHash,omitempty"`
+	Error  string `json:"error,omitempty"`
+}
+
+type SpotDeployResponse struct {
+	Status string `json:"status"`
+	TxHash string `json:"txHash,omitempty"`
+	Error  string `json:"error,omitempty"`
+}
+
+type ValidatorResponse struct {
+	Status string `json:"status"`
+	TxHash string `json:"txHash,omitempty"`
+	Error  string `json:"error,omitempty"`
+}
+
+type MultiSigResponse struct {
+	Status string `json:"status"`
+	TxHash string `json:"txHash,omitempty"`
+	Error  string `json:"error,omitempty"`
+}
+
+type PerpDeployResponse struct {
+	Status string `json:"status"`
+	// Response is either a string or object `{"type": "...", ...}`
+	Response json.RawMessage `json:"response,omitempty"`
+	Data     struct {
+		Statuses []TxStatus `json:"statuses"`
+	} `json:"data"`
+}
+
+type TxStatus struct {
+	Coin   string `json:"coin"`
+	Status string `json:"status"`
+}
+
+type TokenDetail struct {
+	Name                       string              `json:"name"`
+	MaxSupply                  string              `json:"maxSupply"`
+	TotalSupply                string              `json:"totalSupply"`
+	CirculatingSupply          string              `json:"circulatingSupply"`
+	SzDecimals                 int                 `json:"szDecimals"`
+	WeiDecimals                int                 `json:"weiDecimals"`
+	MidPx                      string              `json:"midPx"`
+	MarkPx                     string              `json:"markPx"`
+	PrevDayPx                  string              `json:"prevDayPx"`
+	Genesis                    *TokenDetailGenesis `json:"genesis"`
+	Deployer                   *string             `json:"deployer"`
+	DeployGas                  *string             `json:"deployGas"`
+	DeployTime                 *string             `json:"deployTime"`
+	SeededUsdc                 string              `json:"seededUsdc"`
+	NonCirculatingUserBalances [][]string          `json:"nonCirculatingUserBalances"`
+	FutureEmissions            string              `json:"futureEmissions"`
+}
+
+type TokenDetailGenesis struct {
+	UserBalances          [][]string   `json:"userBalances"`
+	ExistingTokenBalances []MixedArray `json:"existingTokenBalances"`
+}
+
+// PerpDex represents a perpetual DEX
+type PerpDex struct {
+	Name                     string     `json:"name"`
+	FullName                 string     `json:"fullName"`
+	Deployer                 string     `json:"deployer"`
+	OracleUpdater            *string    `json:"oracleUpdater"`
+	FeeRecipient             *string    `json:"feeRecipient"`
+	AssetToStreamingOiCap    [][]string `json:"assetToStreamingOiCap"`    // Array of [coin, cap] tuples
+	AssetToFundingMultiplier [][]string `json:"assetToFundingMultiplier"` // Array of [coin, multiplier] tuples
+}
+
+// PerpDexLimits represents limits for a builder-deployed perp DEX
+type PerpDexLimits struct {
+	TotalOiCap     string     `json:"totalOiCap"`
+	OiSzCapPerPerp string     `json:"oiSzCapPerPerp"`
+	MaxTransferNtl string     `json:"maxTransferNtl"`
+	CoinToOiCap    [][]string `json:"coinToOiCap"` // Array of [coin, cap] tuples
+}
+
+// PerpDexStatus represents status for a builder-deployed perp DEX
+type PerpDexStatus struct {
+	TotalNetDeposit string `json:"totalNetDeposit"`
+}
+
+// PerpDeployAuctionStatus represents the status of a perp deploy auction
+type PerpDeployAuctionStatus struct {
+	StartTimeSeconds int64   `json:"startTimeSeconds"`
+	DurationSeconds  int64   `json:"durationSeconds"`
+	StartGas         string  `json:"startGas"`
+	CurrentGas       string  `json:"currentGas"`
+	EndGas           *string `json:"endGas"`
+}
+
+// AccountHistory represents historical portfolio data for a specific
+// time range. The two history slices are kept in their wire-level
+// [timestamp_ms, "value"] tuple form for fidelity; use Points() /
+// PnlPoints() for the typed view.
+type AccountHistory struct {
+	AccountValueHistory []MixedArray    `json:"accountValueHistory"` // [timestamp_ms, "value"]
+	PnlHistory          []MixedArray    `json:"pnlHistory"`          // [timestamp_ms, "value"]
+	Volume              decimal.Decimal `json:"vlm"`
+}
+
+// HistoryPoint is the typed form of a single [timestamp_ms, "value"]
+// tuple from AccountValueHistory / PnlHistory. Value is kept as the
+// raw decimal string HL emits — callers decide whether to parse it as
+// float64, decimal.Decimal, etc.
+type HistoryPoint struct {
+	Timestamp int64           `json:"timestamp,omitempty"`
+	Value     decimal.Decimal `json:"value"`
+}
+
+// Time returns Timestamp as a time.Time in UTC.
+func (p HistoryPoint) Time() time.Time { return time.UnixMilli(p.Timestamp).UTC() }
+
+// ParsedAccountValue returns AccountValueHistory parsed into typed HistoryPoint
+// entries. Malformed tuples (wrong arity, non-numeric ts, non-string
+// value) are skipped silently.
+func (h AccountHistory) ParsedAccountValue() []HistoryPoint {
+	return parseHistoryPoints(h.AccountValueHistory)
+}
+
+// PasredPNL returns PnlHistory parsed into typed HistoryPoint entries.
+// Same skip-malformed policy as Points.
+func (h AccountHistory) PasredPNL() []HistoryPoint {
+	return parseHistoryPoints(h.PnlHistory)
+}
+
+// LastPnl returns the last value of PnlHistory — what HL's UI shows
+// as "performance" for the window. Returns ("", false) when the
+// series is empty or the trailing tuple is malformed.
+func (h AccountHistory) LastPnl() (string, bool) {
+	if len(h.PnlHistory) == 0 {
+		return "", false
+	}
+	last := h.PnlHistory[len(h.PnlHistory)-1]
+	if len(last) < 2 {
+		return "", false
+	}
+	return last[1].String()
+}
+
+func parseHistoryPoints(raw []MixedArray) []HistoryPoint {
+	out := make([]HistoryPoint, 0, len(raw))
+	for _, e := range raw {
+		if len(e) < 2 {
+			continue
+		}
+		var timestamp int64
+		if err := e[0].Parse(&timestamp); err != nil {
+			continue
+		}
+		valueStr, ok := e[1].String()
+		if !ok {
+			continue
+		}
+		value, _ := decimal.NewFromString(valueStr)
+		out = append(out, HistoryPoint{Timestamp: timestamp, Value: value})
+	}
+	return out
+}
+
+// Portfolio represents a user's portfolio
+type Portfolio []MixedValue // [string, AccountHistory]
+
+// PortfolioBucket is the typed view of a single Portfolio tuple:
+// the window name (e.g. "day", "week", "perpDay", "perpAllTime") and
+// its parsed AccountHistory.
+type PortfolioBucket struct {
+	Name    string
+	History AccountHistory
+}
+
+// PortfolioBuckets parses a raw []Portfolio (the API returns untyped
+// [name, AccountHistory] tuples) into typed buckets. Tuples that fail
+// to decode are skipped silently — callers that need strict parsing
+// should walk the raw form themselves. Use ParseFullPortfolio when you
+// want the standard windows hoisted into named fields.
+func PortfolioBuckets(ps []Portfolio) []PortfolioBucket {
+	out := make([]PortfolioBucket, 0, len(ps))
+	for _, p := range ps {
+		if len(p) < 2 {
+			continue
+		}
+		name, ok := p[0].String()
+		if !ok {
+			continue
+		}
+		var hist AccountHistory
+		if err := p[1].Parse(&hist); err != nil {
+			continue
+		}
+		out = append(out, PortfolioBucket{Name: name, History: hist})
+	}
+	return out
+}
+
+// PortfolioPeriods groups the four standard time windows HL returns
+// for a given account scope (combined-account or perp-only). Missing
+// windows are zero-valued AccountHistory; LastPnl() on a zero-value
+// returns false.
+type PortfolioPeriods struct {
+	Day     AccountHistory
+	Week    AccountHistory
+	Month   AccountHistory
+	AllTime AccountHistory
+}
+
+// FullPortfolio is the fully-parsed view of HL's portfolio response.
+// Combined holds the all-asset windows ("day"/"week"/"month"/"allTime");
+// Perp holds the perp-only windows ("perpDay"/.../"perpAllTime").
+// Unknown bucket names (anything HL adds in the future) are dropped —
+// reach for PortfolioBuckets if you need to see them.
+type FullPortfolio struct {
+	Combined PortfolioPeriods
+	Perp     PortfolioPeriods
+}
+
+// ParseFullPortfolio extracts both the combined and perp time-windows
+// from a raw []Portfolio. Buckets that fail to decode are dropped (same
+// policy as PortfolioBuckets).
+func ParseFullPortfolio(ps []Portfolio) FullPortfolio {
+	var fp FullPortfolio
+	for _, b := range PortfolioBuckets(ps) {
+		switch b.Name {
+		case "day":
+			fp.Combined.Day = b.History
+		case "week":
+			fp.Combined.Week = b.History
+		case "month":
+			fp.Combined.Month = b.History
+		case "allTime":
+			fp.Combined.AllTime = b.History
+		case "perpDay":
+			fp.Perp.Day = b.History
+		case "perpWeek":
+			fp.Perp.Week = b.History
+		case "perpMonth":
+			fp.Perp.Month = b.History
+		case "perpAllTime":
+			fp.Perp.AllTime = b.History
+		}
+	}
+	return fp
+}
+
+// AbstractionMode represents the account abstraction mode
+type AbstractionMode string
+
+const (
+	AbstractionDefault         AbstractionMode = "default"
+	AbstractionDisabled        AbstractionMode = "disabled"
+	AbstractionUnifiedAccount  AbstractionMode = "unifiedAccount"
+	AbstractionPortfolioMargin AbstractionMode = "portfolioMargin"
+	AbstractionDexAbstraction  AbstractionMode = "dexAbstraction"
+)
