@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/signer/core/apitypes"
 )
@@ -926,6 +927,26 @@ func (e *Exchange) ApproveAgent(
 	}
 
 	agentAddress := crypto.PubkeyToAddress(privateKey.PublicKey).Hex()
+	result, err := e.ApproveAgentAddress(ctx, name, agentAddress)
+	if err != nil {
+		return nil, "", err
+	}
+	return result, agentKey, nil
+}
+
+// ApproveAgentAddress authorizes an existing agent key. The caller is
+// responsible for generating and durably storing the corresponding private key
+// before calling this method; this prevents a successful on-exchange approval
+// from racing a failed local key persistence.
+func (e *Exchange) ApproveAgentAddress(
+	ctx context.Context,
+	name *string,
+	agentAddress string,
+) (*AgentApprovalResponse, error) {
+	if !common.IsHexAddress(agentAddress) {
+		return nil, fmt.Errorf("invalid agent address %q", agentAddress)
+	}
+	agentAddress = common.HexToAddress(agentAddress).Hex()
 	nonce := e.nextNonce()
 
 	agentName := ""
@@ -935,7 +956,7 @@ func (e *Exchange) ApproveAgent(
 
 	sig, err := e.signAgent(ctx, agentAddress, agentName, nonce, e.client.baseURL == MainnetAPIURL)
 	if err != nil {
-		return nil, "", err
+		return nil, err
 	}
 
 	// Build action for submission
@@ -956,14 +977,21 @@ func (e *Exchange) ApproveAgent(
 
 	resp, err := e.postAction(ctx, action, sig, nonce)
 	if err != nil {
-		return nil, "", err
+		return nil, err
+	}
+	var envelope struct {
+		Status   string          `json:"status"`
+		Response json.RawMessage `json:"response"`
+	}
+	if err = jUnmarshal(resp, &envelope); err == nil && envelope.Status == "err" {
+		return nil, fmt.Errorf("approve agent rejected: %s", string(envelope.Response))
 	}
 
 	var result AgentApprovalResponse
 	if err := jUnmarshal(resp, &result); err != nil {
-		return nil, "", err
+		return nil, err
 	}
-	return &result, agentKey, nil
+	return &result, nil
 }
 
 // ApproveBuilderFee approves builder fee payment
