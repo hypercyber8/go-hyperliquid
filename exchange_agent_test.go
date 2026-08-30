@@ -19,7 +19,7 @@ func TestApproveAgentAddressUsesCallerPersistedKey(t *testing.T) {
 			t.Errorf("decode request: %v", err)
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"status":"ok"}`))
+		_, _ = w.Write([]byte(`{"status":"ok","response":{"type":"default"}}`))
 	}))
 	defer server.Close()
 
@@ -45,6 +45,28 @@ func TestApproveAgentAddressUsesCallerPersistedKey(t *testing.T) {
 	}
 	if got := action["agentName"]; got != name {
 		t.Fatalf("agent name = %v, want %s", got, name)
+	}
+}
+
+func TestApproveAgentAddressRejectsStatusOKWithoutBusinessResponse(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"status":"ok"}`))
+	}))
+	defer server.Close()
+
+	ownerKey, err := crypto.HexToECDSA(strings.Repeat("1", 64))
+	if err != nil {
+		t.Fatal(err)
+	}
+	exchange := NewExchangeWithInfo(context.Background(), NewAccount(ownerKey), server.URL, "", "", nil)
+	_, err = exchange.ApproveAgentAddress(
+		context.Background(),
+		nil,
+		"0x2222222222222222222222222222222222222222",
+	)
+	if err == nil || !strings.Contains(err.Error(), "without a business response") {
+		t.Fatalf("error = %v, want missing business response", err)
 	}
 }
 

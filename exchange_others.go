@@ -34,7 +34,7 @@ func (e *Exchange) UpdateLeverage(
 	}
 
 	var result UserState
-	if err := e.executeAction(ctx, action, &result); err != nil {
+	if err := e.executeDefaultAction(ctx, action, &result); err != nil {
 		return nil, err
 	}
 	return &result, nil
@@ -61,7 +61,7 @@ func (e *Exchange) UpdateIsolatedMargin(
 	}
 
 	var result UserState
-	if err := e.executeAction(ctx, action, &result); err != nil {
+	if err := e.executeDefaultAction(ctx, action, &result); err != nil {
 		return nil, err
 	}
 	return &result, nil
@@ -251,22 +251,8 @@ func (e *Exchange) SetReferrer(ctx context.Context, code string) (*SetReferrerRe
 		return nil, err
 	}
 
-	// Check for API-level error first. Hyperliquid returns errors as
-	// {"status":"err","response":"message"} where "response" is a string.
-	var errCheck struct {
-		Status   string `json:"status"`
-		Response string `json:"response"`
-	}
-	if jUnmarshal(resp, &errCheck) == nil && errCheck.Status == "err" {
-		msg := errCheck.Response
-		if msg == "" {
-			msg = "unknown error"
-		}
-		return nil, fmt.Errorf("%s", msg)
-	}
-
 	var result SetReferrerResponse
-	if err := jUnmarshal(resp, &result); err != nil {
+	if err := decodeExchangeResponse(resp, "default", &result); err != nil {
 		return nil, err
 	}
 	return &result, nil
@@ -979,16 +965,8 @@ func (e *Exchange) ApproveAgentAddress(
 	if err != nil {
 		return nil, err
 	}
-	var envelope struct {
-		Status   string          `json:"status"`
-		Response json.RawMessage `json:"response"`
-	}
-	if err = jUnmarshal(resp, &envelope); err == nil && envelope.Status == "err" {
-		return nil, fmt.Errorf("approve agent rejected: %s", string(envelope.Response))
-	}
-
 	var result AgentApprovalResponse
-	if err := jUnmarshal(resp, &result); err != nil {
+	if err = decodeExchangeResponse(resp, "default", &result); err != nil {
 		return nil, err
 	}
 	return &result, nil
@@ -1032,23 +1010,9 @@ func (e *Exchange) ApproveBuilderFee(
 		return nil, err
 	}
 
-	// Check for API-level error first. Hyperliquid returns errors as
-	// {"status":"err","response":"message"} where "response" is a string.
-	var errCheck struct {
-		Status   string `json:"status"`
-		Response string `json:"response"`
-	}
-	if jUnmarshal(resp, &errCheck) == nil && errCheck.Status == "err" {
-		msg := errCheck.Response
-		if msg == "" {
-			msg = "unknown error"
-		}
-		return nil, fmt.Errorf("%s", msg)
-	}
-
 	var result ApprovalResponse
-	if err := jUnmarshal(resp, &result); err != nil {
-		return nil, fmt.Errorf("approve builder fee unmarshal failed (raw: %s): %w", string(resp), err)
+	if err := decodeExchangeResponse(resp, "default", &result); err != nil {
+		return nil, err
 	}
 	return &result, nil
 }
@@ -1919,22 +1883,8 @@ func (e *Exchange) UserSetAbstraction(
 		return nil, err
 	}
 
-	// Check for API-level error first. Hyperliquid returns errors as
-	// {"status":"err","response":"message"} where "response" is a string.
-	var errCheck struct {
-		Status   string `json:"status"`
-		Response string `json:"response"`
-	}
-	if jUnmarshal(resp, &errCheck) == nil && errCheck.Status == "err" {
-		msg := errCheck.Response
-		if msg == "" {
-			msg = "unknown error"
-		}
-		return nil, fmt.Errorf("%s", msg)
-	}
-
 	var result ApprovalResponse
-	if err := jUnmarshal(resp, &result); err != nil {
+	if err := decodeExchangeResponse(resp, "default", &result); err != nil {
 		return nil, err
 	}
 	return &result, nil

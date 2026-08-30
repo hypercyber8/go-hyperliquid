@@ -2,8 +2,6 @@ package hyperliquid
 
 import (
 	"context"
-	"encoding/json"
-	"fmt"
 	"sync/atomic"
 	"time"
 
@@ -203,21 +201,37 @@ func (e *Exchange) executeAction(ctx context.Context, action, result any) error 
 		return err
 	}
 
-	// Check for HL error envelope: {"status":"err","response":"..."}
-	// before attempting to unmarshal into the caller's result type.
-	var envelope struct {
-		Status   string          `json:"status"`
-		Response json.RawMessage `json:"response"`
-	}
-	if jErr := jUnmarshal(resp, &envelope); jErr == nil && envelope.Status == "err" {
-		return fmt.Errorf("exchange action rejected: %s", string(envelope.Response))
+	if err = validateExchangeResponse(resp, ""); err != nil {
+		return err
 	}
 
-	if err := jUnmarshal(resp, result); err != nil {
+	if err = jUnmarshal(resp, result); err != nil {
 		return err
 	}
 
 	return nil
+}
+
+func (e *Exchange) executeDefaultAction(ctx context.Context, action, result any) error {
+	nonce := e.nextNonce()
+
+	sig, err := e.signL1Action(
+		ctx,
+		action,
+		e.vault,
+		nonce,
+		e.expiresAfter,
+		e.client.baseURL == MainnetAPIURL,
+	)
+	if err != nil {
+		return err
+	}
+
+	resp, err := e.postAction(ctx, action, sig, nonce)
+	if err != nil {
+		return err
+	}
+	return decodeExchangeResponse(resp, "default", result)
 }
 
 func (e *Exchange) postAction(

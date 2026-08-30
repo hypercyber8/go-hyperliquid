@@ -100,3 +100,22 @@ func TestExecuteAction_OkEnvelopeUnmarshalsResult(t *testing.T) {
 	require.Equal(t, "ok", result.Status)
 	require.Equal(t, "order", result.Response.Type)
 }
+
+func TestExecuteActionRejectsStatusOKWithoutBusinessResponse(t *testing.T) {
+	orig := http.DefaultTransport
+	t.Cleanup(func() { http.DefaultTransport = orig })
+	http.DefaultTransport = &stubRoundTripper{body: `{"status":"ok"}`}
+
+	ex := newExchangeForEnvelopeTest(t)
+	var result struct{}
+	err := ex.executeAction(context.Background(), map[string]any{"type": "noop"}, &result)
+	require.ErrorContains(t, err, "without a business response")
+}
+
+func TestValidateExchangeResponseRejectsUnexpectedBusinessType(t *testing.T) {
+	err := validateExchangeResponse(
+		[]byte(`{"status":"ok","response":{"type":"order","data":{"statuses":[]}}}`),
+		"default",
+	)
+	require.ErrorContains(t, err, `unexpected exchange response type "order", want "default"`)
+}

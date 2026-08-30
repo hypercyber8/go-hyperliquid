@@ -177,24 +177,42 @@ func (e *Exchange) BulkOrders(
 	if err != nil {
 		return nil, err
 	}
+	if mixedResult == nil || !mixedResult.Ok {
+		if mixedResult != nil && mixedResult.Err != "" {
+			return nil, fmt.Errorf("failed to create orders: %s", mixedResult.Err)
+		}
+		return nil, fmt.Errorf("failed to create orders: invalid response")
+	}
+	if mixedResult.Type != "order" {
+		return nil, fmt.Errorf("unexpected exchange response type %q, want %q", mixedResult.Type, "order")
+	}
+	if len(mixedResult.Data.Statuses) != len(orders) {
+		return nil, fmt.Errorf(
+			"exchange returned %d order statuses for %d orders",
+			len(mixedResult.Data.Statuses),
+			len(orders),
+		)
+	}
 
 	statuses := make([]OrderStatus, 0, len(mixedResult.Data.Statuses))
-	if mixedResult != nil {
-		// check if any of the statuses has an error set
-		for _, s := range mixedResult.Data.Statuses {
-			switch {
-			case s.Type() == "string" && s.MustString() == "waitingForTrigger":
-				statuses = append(statuses, OrderStatus{WaitingForTrigger: true})
-			case s.Type() == "object":
-				var status OrderStatus
-				if err = s.Parse(&status); err != nil {
-					return nil, err
-				}
-				if status.Error != nil {
-					return result, fmt.Errorf("%s", *status.Error)
-				}
-				statuses = append(statuses, status)
+	for _, s := range mixedResult.Data.Statuses {
+		switch {
+		case s.Type() == "string" && s.MustString() == "waitingForTrigger":
+			statuses = append(statuses, OrderStatus{WaitingForTrigger: true})
+		case s.Type() == "object":
+			var status OrderStatus
+			if err = s.Parse(&status); err != nil {
+				return nil, err
 			}
+			if status.Error != nil {
+				return result, fmt.Errorf("%s", *status.Error)
+			}
+			if status.Resting == nil && status.Filled == nil {
+				return nil, fmt.Errorf("exchange returned an order status without an outcome")
+			}
+			statuses = append(statuses, status)
+		default:
+			return nil, fmt.Errorf("exchange returned unsupported order status %s", s.Type())
 		}
 	}
 
@@ -227,6 +245,22 @@ func (e *Exchange) BulkOrdersPartial(
 	if err = e.executeAction(ctx, action, &mixedResult); err != nil {
 		return nil, err
 	}
+	if mixedResult == nil || !mixedResult.Ok {
+		if mixedResult != nil && mixedResult.Err != "" {
+			return nil, fmt.Errorf("failed to create orders: %s", mixedResult.Err)
+		}
+		return nil, fmt.Errorf("failed to create orders: invalid response")
+	}
+	if mixedResult.Type != "order" {
+		return nil, fmt.Errorf("unexpected exchange response type %q, want %q", mixedResult.Type, "order")
+	}
+	if len(mixedResult.Data.Statuses) != len(orders) {
+		return nil, fmt.Errorf(
+			"exchange returned %d order statuses for %d orders",
+			len(mixedResult.Data.Statuses),
+			len(orders),
+		)
+	}
 
 	statuses := make([]OrderStatus, 0, len(mixedResult.Data.Statuses))
 	for _, s := range mixedResult.Data.Statuses {
@@ -239,6 +273,8 @@ func (e *Exchange) BulkOrdersPartial(
 				return nil, err
 			}
 			statuses = append(statuses, st) // no abort on st.Error != nil
+		default:
+			return nil, fmt.Errorf("exchange returned unsupported order status %s", s.Type())
 		}
 	}
 
@@ -368,10 +404,18 @@ func (e *Exchange) ModifyOrder(
 		err = fmt.Errorf("failed to modify order: %s", resp.Err)
 		return
 	}
+	if resp.Type != "order" {
+		err = fmt.Errorf("unexpected exchange response type %q, want %q", resp.Type, "order")
+		return
+	}
 
 	data := resp.Data
-	if len(data.Statuses) == 0 {
-		err = fmt.Errorf("no status for modified order: %s", resp.Err)
+	if len(data.Statuses) != 1 {
+		err = fmt.Errorf("exchange returned %d statuses for one modified order", len(data.Statuses))
+		return
+	}
+	if data.Statuses[0].Error != nil {
+		err = fmt.Errorf("failed to modify order: %s", *data.Statuses[0].Error)
 		return
 	}
 
@@ -397,10 +441,22 @@ func (e *Exchange) BulkModifyOrders(
 	if !resp.Ok {
 		return nil, fmt.Errorf("failed to modify orders: %s", resp.Err)
 	}
+	if resp.Type != "order" {
+		return nil, fmt.Errorf("unexpected exchange response type %q, want %q", resp.Type, "order")
+	}
 
 	data := resp.Data
-	if len(data.Statuses) == 0 {
-		return nil, fmt.Errorf("no status for modified order: %s", resp.Err)
+	if len(data.Statuses) != len(modifyRequests) {
+		return nil, fmt.Errorf(
+			"exchange returned %d statuses for %d modified orders",
+			len(data.Statuses),
+			len(modifyRequests),
+		)
+	}
+	for _, status := range data.Statuses {
+		if status.Error != nil {
+			return nil, fmt.Errorf("failed to modify order: %s", *status.Error)
+		}
 	}
 
 	return data.Statuses, nil

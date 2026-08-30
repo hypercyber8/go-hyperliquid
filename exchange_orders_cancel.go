@@ -60,6 +60,16 @@ func (e *Exchange) BulkCancel(
 		}
 		return res, fmt.Errorf("cancel failed")
 	}
+	if res.Type != "cancel" {
+		return res, fmt.Errorf("unexpected exchange response type %q, want %q", res.Type, "cancel")
+	}
+	if len(res.Data.Statuses) != len(requests) {
+		return res, fmt.Errorf(
+			"exchange returned %d cancel statuses for %d requests",
+			len(res.Data.Statuses),
+			len(requests),
+		)
+	}
 
 	if err := res.Data.Statuses.FirstError(); err != nil {
 		return res, err
@@ -123,6 +133,16 @@ func (e *Exchange) BulkCancelByCloids(
 			return res, fmt.Errorf("%s", res.Err)
 		}
 		return res, fmt.Errorf("cancel failed")
+	}
+	if res.Type != "cancel" {
+		return res, fmt.Errorf("unexpected exchange response type %q, want %q", res.Type, "cancel")
+	}
+	if len(res.Data.Statuses) != len(requests) {
+		return res, fmt.Errorf(
+			"exchange returned %d cancel statuses for %d requests",
+			len(res.Data.Statuses),
+			len(requests),
+		)
 	}
 
 	if err := res.Data.Statuses.FirstError(); err != nil {
